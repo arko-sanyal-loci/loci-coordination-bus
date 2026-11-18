@@ -19,10 +19,49 @@ PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 EVENTS = frozenset({"task.created", "task.claimed", "task.heartbeat", "task.completed",
                     "review.requested", "review.approved", "conflict.opened",
-                    "conflict.resolved", "memory.summary", "agent.message"})
+                    "conflict.resolved", "memory.summary", "agent.message",
+                    "infer.requested", "infer.completed", "oversight.requested",
+                    "oversight.verdict", "node.telemetry", "budget.state"})
 OPS = frozenset({"create_task", "claim_task", "heartbeat", "complete_task",
                  "request_review", "approve_review", "open_conflict",
-                 "resolve_conflict", "record_memory", "send_message"})
+                 "resolve_conflict", "record_memory", "send_message",
+                 "request_inference", "report_inference", "request_oversight",
+                 "issue_verdict", "report_telemetry", "report_budget"})
+
+# Hybrid local + remote inference events. Each is bound to exactly one operation and a minimal
+# payload shape, so a node scoped to e.g. report_telemetry cannot emit a verdict.
+# See loci-memory-engine docs/hybrid-metal-remote-inference-design.md.
+LANES = frozenset({"compact", "expand", "remote"})
+INFERENCE_EVENTS: dict[str, tuple[str, frozenset[str], dict[str, frozenset[str]]]] = {
+    "infer.requested": ("request_inference", frozenset({"lane", "prompt_hash", "est_tokens"}),
+                        {"lane": LANES}),
+    "infer.completed": ("report_inference", frozenset({"lane", "tokens_in", "tokens_out",
+                                                       "latency_ms", "tests"}),
+                        {"lane": LANES, "tests": frozenset({"passed", "failed", "skipped"})}),
+    "oversight.requested": ("request_oversight", frozenset({"reason", "draft_ref"}),
+                            {"reason": frozenset({"critical", "failed", "sampled", "urgent"})}),
+    "oversight.verdict": ("issue_verdict", frozenset({"verdict", "reason", "cost_usd"}),
+                          {"verdict": frozenset({"approve", "patch", "redo"})}),
+    "node.telemetry": ("report_telemetry", frozenset({"node", "vram_used_mb", "vram_total_mb",
+                                                      "util_pct", "queue_depth"}), {}),
+    "budget.state": ("report_budget", frozenset({"spent_usd", "cap_usd", "mode"}),
+                     {"mode": frozenset({"normal", "frugal", "local-only"})}),
+}
+
+
+def _inference(event_type: str, operation: str, payload: Mapping[str, Any]) -> None:
+    spec = INFERENCE_EVENTS.get(event_type)
+    if spec is None:
+        return
+    expected_op, required, enums = spec
+    if operation != expected_op:
+        raise ProtocolError(f"{event_type} must use operation {expected_op}")
+    missing = required.difference(payload.keys())
+    if missing:
+        raise ProtocolError(f"{event_type} payload missing: " + ", ".join(sorted(missing)))
+    for key, allowed in enums.items():
+        if payload.get(key) not in allowed:
+            raise ProtocolError(f"{event_type} payload field {key!r} has an invalid value")
 FORBIDDEN = frozenset({"command", "commands", "shell", "exec", "tool_call",
                        "permissions", "credentials", "secret", "token",
                        "api_key", "system_prompt"})
@@ -143,6 +182,7 @@ class EventEnvelope:
             raise ProtocolError("base_commit must be a full hexadecimal Git SHA")
         _paths(self.allowed_paths)
         _payload(self.payload)
+        _inference(self.event_type, self.operation, self.payload)
         if self.sequence < 1 or not self.idempotency_key or len(self.idempotency_key) > 200:
             raise ProtocolError("invalid sequence or idempotency_key")
         if not re.fullmatch(r"[0-9a-f]{64}", self.signature):
